@@ -1,0 +1,21 @@
+[project]
+name = "feishu-wiki-tools"
+version = "0.1.0"
+description = "Copy and export Feishu (Lark) wiki pages with full fidelity"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "requests>=2.28",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.40"]
+
+[project.scripts]
+feishu-copy = "feishu_copy_page:main"
+feishu-export = "feishu_wiki:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
