@@ -470,12 +470,57 @@ def _clean(obj: object) -> object:
     return obj
 
 
+def _compute_heading_numbers(src_blocks: list[dict]) -> dict[str, str]:
+    """Walk source blocks in document order and assign hierarchical numbers.
+
+    Returns {block_id: "1.2 "} for each heading block.
+    """
+    bmap = {b["block_id"]: b for b in src_blocks}
+    root = next((b for b in src_blocks if b["block_type"] == 1), None)
+    if not root:
+        return {}
+
+    # Check if any headings exist
+    has_headings = any(3 <= b["block_type"] <= 11 for b in src_blocks)
+    if not has_headings:
+        return {}
+
+    counters = [0] * 10  # counters[1..9]
+    result: dict[str, str] = {}
+
+    def walk(block_ids: list[str]) -> None:
+        for bid in block_ids:
+            b = bmap.get(bid)
+            if not b:
+                continue
+            bt = b["block_type"]
+
+            if 3 <= bt <= 11:
+                level = bt - 2  # 1..9
+                counters[level] += 1
+                for i in range(level + 1, 10):
+                    counters[i] = 0
+                # Build number, skipping leading unseen levels (counter=0)
+                parts = [str(counters[i]) for i in range(1, level + 1)]
+                while parts and parts[0] == "0":
+                    parts.pop(0)
+                result[bid] = ".".join(parts) + " " if parts else ""
+
+            if b.get("children"):
+                walk(b["children"])
+
+    walk(root.get("children", []))
+    return result
+
+
 def _prepare(
     src: dict, image_cache: dict[str, tuple[bytes, int, int]],
+    heading_numbers: dict[str, str] | None = None,
 ) -> dict | None:
     """Convert a read-API block to create-API format (without children).
 
     image_cache: {file_token: (bytes, width, height)} from _prefetch_images.
+    heading_numbers: optional {block_id: "1.2 "} to prepend to heading text.
     """
     bt = src["block_type"]
     if bt in (1, 25):  # page root or grid_column (auto-created) — skip
@@ -488,6 +533,26 @@ def _prepare(
     block = {"block_type": bt}
     if key in src:
         content = _clean(json.loads(json.dumps(src[key])))
+
+        # Prepend heading number if available (styled blue like Feishu auto-numbering)
+        if 3 <= bt <= 11 and heading_numbers:
+            num = heading_numbers.get(src.get("block_id", ""))
+            if num:
+                elements = content.get("elements", [])
+                # Strip existing manual numbers (e.g., "1.1.4.1. ") from first element
+                if elements and "text_run" in elements[0]:
+                    first = elements[0]["text_run"]
+                    old = first.get("content", "")
+                    stripped = re.sub(r"^(\d+\.)+\d*\s*", "", old)
+                    if stripped != old:
+                        first["content"] = stripped
+                num_element = {
+                    "text_run": {
+                        "content": num,
+                        "text_element_style": {"text_color": 5},
+                    }
+                }
+                content["elements"] = [num_element] + elements
 
         if bt == 18:  # Table: drop source-specific cell IDs
             content.pop("cells", None)
@@ -559,6 +624,7 @@ def _queue_children(
 def copy_blocks(
     token_mgr: TokenManager, src_blocks: list[dict], dst_doc_id: str,
     image_cache: dict[str, tuple[bytes, int, int]],
+    heading_numbers: dict[str, str] | None = None,
 ) -> int:
     """Reproduce the source block tree inside the destination document."""
     bmap = {b["block_id"]: b for b in src_blocks}
@@ -595,7 +661,7 @@ def copy_blocks(
                 s = bmap.get(cid)
                 if not s:
                     continue
-                b = _prepare(s, image_cache)
+                b = _prepare(s, image_cache, heading_numbers=heading_numbers)
                 if b:
                     pairs.append((b, s))
 
@@ -731,6 +797,7 @@ def _copy_single_page(
     target_node_token: str,
     title: str | None = None,
     depth: int = 0,
+    heading_numbering: bool = False,
 ) -> tuple[str, str]:
     """Copy one wiki page's content under the target node.
 
@@ -756,6 +823,19 @@ def _copy_single_page(
     blocks = get_all_blocks(user_token, obj_token)
     log.info("%s  %d blocks", indent, len(blocks))
 
+    # Log first heading block for API field discovery
+    for b in blocks:
+        if 3 <= b["block_type"] <= 11:
+            log.debug("  Sample heading block: %s", json.dumps(b, ensure_ascii=False, indent=2))
+            break
+
+    # Compute heading numbers if requested
+    heading_numbers = None
+    if heading_numbering:
+        heading_numbers = _compute_heading_numbers(blocks)
+        if heading_numbers:
+            log.info("%s  Heading numbers computed for %d headings", indent, len(heading_numbers))
+
     # Pre-download images
     try:
         image_cache = _prefetch_images(user_token, blocks, source_node_token)
@@ -769,7 +849,7 @@ def _copy_single_page(
     log.info("%s  → %s", indent, f"https://my.feishu.cn/wiki/{node_token}")
 
     # Copy blocks
-    n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache)
+    n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache, heading_numbers=heading_numbers)
     log.info("%s  %d blocks created", indent, n)
 
     # Cleanup empty tails
@@ -793,6 +873,7 @@ def _copy_recursive(
     target_node_token: str,
     title: str | None = None,
     depth: int = 0,
+    heading_numbering: bool = False,
 ) -> int:
     """Recursively copy a wiki page and all its subpages.
 
@@ -803,7 +884,7 @@ def _copy_recursive(
     # Copy this page
     new_node_token, _ = _copy_single_page(
         token_mgr, source_node_token, target_space_id, target_node_token,
-        title=title, depth=depth,
+        title=title, depth=depth, heading_numbering=heading_numbering,
     )
     if not new_node_token:
         return 0
@@ -829,7 +910,7 @@ def _copy_recursive(
         count += _copy_recursive(
             token_mgr, child_token, source_space_id,
             target_space_id, new_node_token,
-            depth=depth + 1,
+            depth=depth + 1, heading_numbering=heading_numbering,
         )
 
     return count
@@ -848,6 +929,10 @@ def main() -> None:
     parser.add_argument(
         "-r", "--recursive", action="store_true",
         help="Recursively copy all subpages",
+    )
+    parser.add_argument(
+        "--heading-numbers", action="store_true",
+        help="Prepend auto-generated hierarchical numbers to headings (e.g., 1.1, 1.2)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
@@ -885,6 +970,7 @@ def main() -> None:
                 token_mgr, source_node_token, source_space_id,
                 target_space_id, target_node_token,
                 title=new_title,
+                heading_numbering=args.heading_numbers,
             )
             log.info("Done — %d page(s) copied", total_pages)
         finally:
@@ -943,9 +1029,15 @@ def main() -> None:
                 )
                 raise SystemExit(1)
 
+        heading_numbers = None
+        if args.heading_numbers:
+            heading_numbers = _compute_heading_numbers(blocks)
+            if heading_numbers:
+                log.info("  Heading numbers computed for %d headings", len(heading_numbers))
+
         log.info("  Copying blocks …")
         try:
-            n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache)
+            n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache, heading_numbers=heading_numbers)
             log.info("  %d blocks created", n)
         finally:
             _close_browser()
