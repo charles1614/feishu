@@ -7,10 +7,12 @@ tables, and layout containers.
 
 Usage:
     python feishu_copy_page.py <source_url> <target_url> [--title "Custom Title"]
+    python feishu_copy_page.py <source_url> <target_url> --recursive
 
 Examples:
     python feishu_copy_page.py https://my.feishu.cn/wiki/ABC123 https://my.feishu.cn/wiki/DEF456
     python feishu_copy_page.py ABC123 DEF456 --title "My Copy"
+    python feishu_copy_page.py ABC123 DEF456 --recursive
 
 Environment variables (via .env):
     FEISHU_APP_ID      - Feishu app ID
@@ -30,7 +32,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from dotenv import load_dotenv
 
-from feishu_wiki import BASE_URL, get_all_blocks, get_valid_user_token, get_wiki_node
+from feishu_wiki import (
+    BASE_URL,
+    get_all_blocks,
+    get_valid_user_token,
+    get_wiki_children,
+    get_wiki_node,
+)
 
 try:
     from playwright.sync_api import sync_playwright
@@ -83,13 +91,47 @@ class TokenManager:
         return self._token
 
 
+# ── Rate-limit retry ─────────────────────────────────────────────────────────
+
+# Feishu rate-limit error codes (99991400 = frequency limit, 99991429 = too many requests)
+_RATE_LIMIT_CODES = {99991400, 99991429}
+_MAX_RETRIES = 5
+_INITIAL_BACKOFF = 1  # seconds
+
+
+def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """Make an HTTP request with automatic retry on rate-limit errors."""
+    backoff = _INITIAL_BACKOFF
+    for attempt in range(_MAX_RETRIES):
+        resp = requests.request(method, url, **kwargs)
+        # Retry on HTTP 429
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", backoff))
+            log.debug("  Rate limited (HTTP 429), retrying in %ds …", retry_after)
+            time.sleep(retry_after)
+            backoff = min(backoff * 2, 30)
+            continue
+        # Retry on Feishu rate-limit error codes
+        try:
+            data = resp.json()
+            if data.get("code") in _RATE_LIMIT_CODES:
+                log.debug("  Rate limited (code=%d), retrying in %ds …", data["code"], backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+        except ValueError:
+            pass
+        return resp
+    return resp  # return last response even if still rate-limited
+
+
 # ── API helpers ──────────────────────────────────────────────────────────────
 
 
 def create_document(user_token: str, title: str) -> str:
     """Create a standalone Feishu document (fallback). Returns document_id."""
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/docx/v1/documents",
+    resp = _request_with_retry(
+        "POST", f"{BASE_URL}/open-apis/docx/v1/documents",
         headers={"Authorization": f"Bearer {user_token}"},
         json={"title": title},
     )
@@ -103,8 +145,8 @@ def create_wiki_node(
     user_token: str, space_id: str, parent_node_token: str, title: str,
 ) -> tuple[str, str]:
     """Create a new wiki page (docx) under parent. Returns (node_token, obj_token)."""
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/wiki/v2/spaces/{space_id}/nodes",
+    resp = _request_with_retry(
+        "POST", f"{BASE_URL}/open-apis/wiki/v2/spaces/{space_id}/nodes",
         headers={"Authorization": f"Bearer {user_token}"},
         json={
             "obj_type": "docx",
@@ -126,8 +168,8 @@ def create_children(
     """Insert blocks as children of parent_id. Returns created blocks with new IDs."""
     if not blocks:
         return []
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{parent_id}/children",
+    resp = _request_with_retry(
+        "POST", f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{parent_id}/children",
         headers={"Authorization": f"Bearer {user_token}"},
         json={"children": blocks, "index": index},
         timeout=30,
@@ -142,8 +184,8 @@ def create_children(
 
 def get_block(user_token: str, doc_id: str, block_id: str) -> dict:
     """Fetch a single block (used to read auto-created table cells)."""
-    resp = requests.get(
-        f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}",
+    resp = _request_with_retry(
+        "GET", f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}",
         headers={"Authorization": f"Bearer {user_token}"},
     )
     data = resp.json()
@@ -156,8 +198,8 @@ def delete_children_tail(
     user_token: str, doc_id: str, parent_id: str, start_index: int, end_index: int,
 ) -> None:
     """Delete children of a block by index range [start_index, end_index)."""
-    resp = requests.delete(
-        f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{parent_id}/children/batch_delete",
+    resp = _request_with_retry(
+        "DELETE", f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{parent_id}/children/batch_delete",
         headers={"Authorization": f"Bearer {user_token}"},
         json={"start_index": start_index, "end_index": end_index},
         timeout=10,
@@ -169,8 +211,8 @@ def delete_children_tail(
 
 def download_media(user_token: str, file_token: str) -> bytes:
     """Download image/file by file_token via Open API."""
-    resp = requests.get(
-        f"{BASE_URL}/open-apis/drive/v1/medias/{file_token}/download",
+    resp = _request_with_retry(
+        "GET", f"{BASE_URL}/open-apis/drive/v1/medias/{file_token}/download",
         headers={"Authorization": f"Bearer {user_token}"},
         timeout=30,
     )
@@ -356,8 +398,8 @@ def upload_image_to_block(
     # Step 1: Upload (with retry on timeout/connection errors)
     for attempt in range(3):
         try:
-            resp = requests.post(
-                f"{BASE_URL}/open-apis/drive/v1/medias/upload_all",
+            resp = _request_with_retry(
+                "POST", f"{BASE_URL}/open-apis/drive/v1/medias/upload_all",
                 headers={"Authorization": f"Bearer {user_token}"},
                 data={
                     "parent_type": "docx_image",
@@ -384,8 +426,8 @@ def upload_image_to_block(
     if width and height:
         replace_body["width"] = width
         replace_body["height"] = height
-    resp2 = requests.patch(
-        f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}",
+    resp2 = _request_with_retry(
+        "PATCH", f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}",
         headers={"Authorization": f"Bearer {user_token}"},
         json={"replace_image": replace_body},
     )
@@ -679,6 +721,120 @@ def _cleanup_empty_tails(user_token: str, dst_doc_id: str, src_blocks: list[dict
         log.info("  Cleaned up %d auto-created empty paragraph(s)", deleted)
 
 
+# ── Single-page copy helper ──────────────────────────────────────────────────
+
+
+def _copy_single_page(
+    token_mgr: TokenManager,
+    source_node_token: str,
+    target_space_id: str,
+    target_node_token: str,
+    title: str | None = None,
+    depth: int = 0,
+) -> tuple[str, str]:
+    """Copy one wiki page's content under the target node.
+
+    Returns (new_node_token, new_obj_token / dst_doc_id).
+    """
+    indent = "  " * depth
+    user_token = token_mgr.get()
+
+    # Read source
+    src_node = get_wiki_node(user_token, source_node_token)
+    src_title = src_node.get("title", "Untitled")
+    obj_token = src_node["obj_token"]
+    obj_type = src_node.get("obj_type")
+
+    page_title = title or src_title
+    log.info("%s  Copying page: %s", indent, page_title)
+
+    if obj_type != "docx":
+        log.warning("%s  Skipping non-docx page (type=%s): %s", indent, obj_type, src_title)
+        return "", ""
+
+    # Fetch blocks
+    blocks = get_all_blocks(user_token, obj_token)
+    log.info("%s  %d blocks", indent, len(blocks))
+
+    # Pre-download images
+    try:
+        image_cache = _prefetch_images(user_token, blocks, source_node_token)
+    except Exception:
+        image_cache = {}
+
+    # Create target wiki node
+    node_token, dst_doc_id = create_wiki_node(
+        user_token, target_space_id, target_node_token, page_title,
+    )
+    log.info("%s  → %s", indent, f"https://my.feishu.cn/wiki/{node_token}")
+
+    # Copy blocks
+    n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache)
+    log.info("%s  %d blocks created", indent, n)
+
+    # Cleanup empty tails
+    try:
+        user_token = token_mgr.get()
+        _cleanup_empty_tails(user_token, dst_doc_id, blocks)
+    except Exception:
+        pass
+
+    return node_token, dst_doc_id
+
+
+# ── Recursive copy ───────────────────────────────────────────────────────────
+
+
+def _copy_recursive(
+    token_mgr: TokenManager,
+    source_node_token: str,
+    source_space_id: str,
+    target_space_id: str,
+    target_node_token: str,
+    title: str | None = None,
+    depth: int = 0,
+) -> int:
+    """Recursively copy a wiki page and all its subpages.
+
+    Returns total number of pages copied.
+    """
+    indent = "  " * depth
+
+    # Copy this page
+    new_node_token, _ = _copy_single_page(
+        token_mgr, source_node_token, target_space_id, target_node_token,
+        title=title, depth=depth,
+    )
+    if not new_node_token:
+        return 0
+
+    count = 1
+
+    # Get children of source node
+    user_token = token_mgr.get()
+    src_node = get_wiki_node(user_token, source_node_token)
+    if not src_node.get("has_child"):
+        return count
+
+    children = get_wiki_children(user_token, source_space_id, source_node_token)
+    if children:
+        log.info("%s  %d subpage(s) found", indent, len(children))
+
+    for i, child in enumerate(children):
+        child_token = child.get("node_token", "")
+        if not child_token:
+            continue
+        if i > 0:
+            time.sleep(1)  # pause between pages to avoid rate limits
+        count += _copy_recursive(
+            token_mgr, child_token, source_space_id,
+            target_space_id, new_node_token,
+            depth=depth + 1,
+        )
+
+    return count
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -688,7 +844,11 @@ def main() -> None:
     )
     parser.add_argument("source", help="Source wiki URL or node token")
     parser.add_argument("target", help="Target parent wiki URL or node token")
-    parser.add_argument("--title", help="New page title (default: 'Copy of <source>')")
+    parser.add_argument("--title", help="New page title (default: original title)")
+    parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="Recursively copy all subpages",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
@@ -709,80 +869,95 @@ def main() -> None:
     token_mgr = TokenManager(app_id, app_secret)
     user_token = token_mgr.get()
 
-    # 1. Read source wiki node
-    log.info("[1/5] Reading source node %s …", source_node_token)
-    src_node = get_wiki_node(user_token, source_node_token)
-    src_title = src_node.get("title", "Untitled")
-    obj_token = src_node["obj_token"]
-    obj_type = src_node.get("obj_type")
-    log.info("  Title: %s", src_title)
-    log.info("  Type : %s  obj_token: %s", obj_type, obj_token)
+    # Resolve target space_id
+    target_node = get_wiki_node(user_token, target_node_token)
+    target_space_id = target_node["space_id"]
 
-    if obj_type != "docx":
-        log.error("Only docx is supported (got %s)", obj_type)
-        raise SystemExit(1)
+    if args.recursive:
+        # ── Recursive mode ───────────────────────────────────────────────
+        src_node = get_wiki_node(user_token, source_node_token)
+        source_space_id = src_node["space_id"]
+        new_title = args.title  # None means use original title per page
 
-    # 2. Fetch all blocks
-    log.info("[2/5] Fetching blocks …")
-    blocks = get_all_blocks(user_token, obj_token)
-    log.info("  %d blocks", len(blocks))
-
-    # 3. Pre-download all images in parallel
-    log.info("[3/5] Downloading images …")
-    try:
-        image_cache = _prefetch_images(user_token, blocks, source_node_token)
-    except Exception:
-        image_cache = {}
-
-    # 4. Create target page and copy blocks
-    new_title = args.title or f"Copy of {src_title}"
-    log.info("[4/5] Creating new wiki page under %s …", target_node_token)
-    try:
-        target_node = get_wiki_node(user_token, target_node_token)
-        space_id = target_node["space_id"]
-        node_token, dst_doc_id = create_wiki_node(
-            user_token, space_id, target_node_token, new_title,
-        )
-        result_url = f"https://my.feishu.cn/wiki/{node_token}"
-        log.info("  node_token: %s", node_token)
-        log.info("  doc_id:     %s", dst_doc_id)
-    except Exception as e:
-        log.warning("  Wiki node creation failed: %s", e)
-        log.info("  Falling back to standalone document …")
+        log.info("Recursively copying %s → %s …", source_node_token, target_node_token)
         try:
-            dst_doc_id = create_document(user_token, new_title)
-            result_url = f"https://my.feishu.cn/docx/{dst_doc_id}"
-            log.info("  doc_id: %s", dst_doc_id)
-        except Exception:
-            log.error(
-                "Cannot create wiki node or document.\n"
-                "Please add the required permissions to your Feishu app:\n"
-                "  - wiki:wiki (or wiki:node:create)  → create wiki pages\n"
-                "  - docx:document (or docx:document:create) → create documents\n"
-                "  - docx:document:write → write blocks\n"
-                "  - drive:drive (or drive:file:upload) → upload images\n"
-                "\nGo to: https://open.feishu.cn/app/%s/auth\n"
-                "Then delete .feishu_token_cache.json and re-run.",
-                app_id,
+            total_pages = _copy_recursive(
+                token_mgr, source_node_token, source_space_id,
+                target_space_id, target_node_token,
+                title=new_title,
             )
+            log.info("Done — %d page(s) copied", total_pages)
+        finally:
+            _close_browser()
+    else:
+        # ── Single-page mode (original behaviour) ────────────────────────
+        log.info("[1/5] Reading source node %s …", source_node_token)
+        src_node = get_wiki_node(user_token, source_node_token)
+        src_title = src_node.get("title", "Untitled")
+        obj_token = src_node["obj_token"]
+        obj_type = src_node.get("obj_type")
+        log.info("  Title: %s", src_title)
+        log.info("  Type : %s  obj_token: %s", obj_type, obj_token)
+
+        if obj_type != "docx":
+            log.error("Only docx is supported (got %s)", obj_type)
             raise SystemExit(1)
 
-    log.info("  Copying blocks …")
-    try:
-        n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache)
-        log.info("  %d blocks created", n)
-    finally:
-        _close_browser()
+        log.info("[2/5] Fetching blocks …")
+        blocks = get_all_blocks(user_token, obj_token)
+        log.info("  %d blocks", len(blocks))
 
-    # 5. Clean up auto-created empty paragraphs
-    log.info("[5/5] Cleaning up …")
-    try:
-        user_token = token_mgr.get()
-        _cleanup_empty_tails(user_token, dst_doc_id, blocks)
-    except Exception as e:
-        log.warning("  Cleanup skipped: %s", e)
+        log.info("[3/5] Downloading images …")
+        try:
+            image_cache = _prefetch_images(user_token, blocks, source_node_token)
+        except Exception:
+            image_cache = {}
 
-    log.info("Done → %s", result_url)
+        new_title = args.title or src_title
+        log.info("[4/5] Creating new wiki page under %s …", target_node_token)
+        try:
+            node_token, dst_doc_id = create_wiki_node(
+                user_token, target_space_id, target_node_token, new_title,
+            )
+            result_url = f"https://my.feishu.cn/wiki/{node_token}"
+            log.info("  node_token: %s", node_token)
+            log.info("  doc_id:     %s", dst_doc_id)
+        except Exception as e:
+            log.warning("  Wiki node creation failed: %s", e)
+            log.info("  Falling back to standalone document …")
+            try:
+                dst_doc_id = create_document(user_token, new_title)
+                result_url = f"https://my.feishu.cn/docx/{dst_doc_id}"
+                log.info("  doc_id: %s", dst_doc_id)
+            except Exception:
+                log.error(
+                    "Cannot create wiki node or document.\n"
+                    "Please add the required permissions to your Feishu app:\n"
+                    "  - wiki:wiki (or wiki:node:create)  → create wiki pages\n"
+                    "  - docx:document (or docx:document:create) → create documents\n"
+                    "  - docx:document:write → write blocks\n"
+                    "  - drive:drive (or drive:file:upload) → upload images\n"
+                    "\nGo to: https://open.feishu.cn/app/%s/auth\n"
+                    "Then delete .feishu_token_cache.json and re-run.",
+                    app_id,
+                )
+                raise SystemExit(1)
+
+        log.info("  Copying blocks …")
+        try:
+            n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache)
+            log.info("  %d blocks created", n)
+        finally:
+            _close_browser()
+
+        log.info("[5/5] Cleaning up …")
+        try:
+            user_token = token_mgr.get()
+            _cleanup_empty_tails(user_token, dst_doc_id, blocks)
+        except Exception as e:
+            log.warning("  Cleanup skipped: %s", e)
+
+        log.info("Done → %s", result_url)
 
 
 if __name__ == "__main__":
