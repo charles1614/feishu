@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Copy full content of a Feishu wiki page to a new wiki page.
+"""Copy / sync Feishu wiki pages with full content preservation.
 
-Creates a new child wiki page under the target node and copies all blocks
-from the source page, preserving text, headings, lists, code, images,
-tables, and layout containers.
+Modes:
+    Single page:   feishu_copy_page.py SOURCE TARGET
+    Full copy:     feishu_copy_page.py SOURCE TARGET -r
+    Daily sync:    feishu_copy_page.py SOURCE TARGET -s [-n]
 
-Usage:
-    python feishu_copy_page.py <source_url> <target_url> [--title "Custom Title"]
-    python feishu_copy_page.py <source_url> <target_url> --recursive
+The -s (--sync) flag is the recommended way to keep a wiki tree in sync.
+First run copies everything; subsequent runs only update new/changed pages
+and print a structured change summary. Logs are saved to sync_logs/.
 
 Examples:
-    python feishu_copy_page.py https://my.feishu.cn/wiki/ABC123 https://my.feishu.cn/wiki/DEF456
-    python feishu_copy_page.py ABC123 DEF456 --title "My Copy"
-    python feishu_copy_page.py ABC123 DEF456 --recursive
+    # Daily sync with heading numbers (recommended):
+    feishu_copy_page.py SOURCE TARGET -s -n
+
+    # One-time full copy:
+    feishu_copy_page.py SOURCE TARGET -r --fix-refs -n
+
+    # Single page:
+    feishu_copy_page.py SOURCE TARGET --title "My Copy"
 
 Environment variables (via .env):
     FEISHU_APP_ID      - Feishu app ID
@@ -25,9 +31,11 @@ import argparse
 import json
 import logging
 import os
+import hashlib
 import re
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -243,6 +251,8 @@ def download_media(user_token: str, file_token: str) -> bytes:
 _browser_ctx = None  # reuse across calls
 _browser_failed = False  # don't retry if browser launch failed
 _BROWSER_STATE_FILE = os.path.join(os.path.dirname(__file__) or ".", ".feishu_browser_state.json")
+_SYNC_STATE_FILE = os.path.join(os.path.dirname(__file__) or ".", ".feishu_sync_state.json")
+_DEFAULT_LOG_DIR = os.path.join(os.path.dirname(__file__) or ".", "sync_logs")
 
 
 def _get_browser_context(source_node_token: str) -> dict:
@@ -947,6 +957,539 @@ def _fixup_references(
     return fixed_blocks
 
 
+# ── Logging setup ───────────────────────────────────────────────────────────
+
+
+def _setup_file_logging(log_dir: str) -> str | None:
+    """Set up dual logging: console (INFO) + file (DEBUG).
+
+    Creates log_dir if needed, generates a dated log file like
+    sync_logs/26-03-02-001.log (auto-incrementing within same day).
+    Returns the log file path, or None if setup failed.
+    """
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as e:
+        log.warning("Cannot create log dir %s: %s", log_dir, e)
+        return None
+
+    today = datetime.now().strftime("%y-%m-%d")
+    # Find next sequence number for today
+    seq = 1
+    while True:
+        log_file = os.path.join(log_dir, f"{today}-{seq:03d}.log")
+        if not os.path.exists(log_file):
+            break
+        seq += 1
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
+    ))
+    logging.getLogger().addHandler(file_handler)
+    return log_file
+
+
+# ── Incremental sync ────────────────────────────────────────────────────────
+
+
+def _load_sync_state() -> dict | None:
+    """Load sync state from disk. Returns None if no state file exists."""
+    if not os.path.exists(_SYNC_STATE_FILE):
+        return None
+    with open(_SYNC_STATE_FILE) as f:
+        return json.load(f)
+
+
+def _save_sync_state(state: dict) -> None:
+    """Write sync state to disk atomically."""
+    tmp = _SYNC_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, _SYNC_STATE_FILE)
+
+
+def _compute_content_hash(blocks: list[dict]) -> str:
+    """Compute SHA-256 hash of block content for change detection.
+
+    Strips volatile identity fields, keeping only structural content.
+    """
+    def _strip(obj: object) -> object:
+        if isinstance(obj, dict):
+            return {
+                k: _strip(v) for k, v in sorted(obj.items())
+                if k not in ("block_id", "parent_id", "children", "comment_ids")
+            }
+        if isinstance(obj, list):
+            return [_strip(v) for v in obj]
+        return obj
+
+    stripped = [_strip(b) for b in blocks]
+    raw = json.dumps(stripped, sort_keys=True, ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _scan_source_tree(
+    token_mgr: TokenManager,
+    source_node_token: str,
+    source_space_id: str,
+    depth: int = 0,
+) -> list[dict]:
+    """Walk source wiki tree collecting node metadata (without fetching blocks)."""
+    user_token = token_mgr.get()
+    node = get_wiki_node(user_token, source_node_token)
+
+    entry = {
+        "node_token": node["node_token"],
+        "title": node.get("title", "Untitled"),
+        "obj_token": node.get("obj_token", ""),
+        "obj_type": node.get("obj_type", ""),
+        "obj_edit_time": str(node.get("obj_edit_time", "")),
+        "has_child": node.get("has_child", False),
+        "depth": depth,
+        "children_tokens": [],
+    }
+
+    result = [entry]
+
+    if node.get("has_child"):
+        children = get_wiki_children(user_token, source_space_id, source_node_token)
+        entry["children_tokens"] = [c["node_token"] for c in children]
+        for child in children:
+            result.extend(_scan_source_tree(
+                token_mgr, child["node_token"], source_space_id, depth + 1,
+            ))
+
+    return result
+
+
+def _extract_headings(blocks: list[dict]) -> list[str]:
+    """Extract heading text from blocks for summary display."""
+    headings: list[str] = []
+    for b in blocks:
+        bt = b["block_type"]
+        if 3 <= bt <= 11:
+            key = f"heading{bt - 2}"
+            elements = b.get(key, {}).get("elements", [])
+            text = "".join(
+                e.get("text_run", {}).get("content", "") for e in elements
+            )
+            text = text.strip()
+            if text:
+                # Strip manual numbering for cleaner display
+                text = re.sub(r"^(\d+\.)+\d*\s*", "", text)
+                headings.append(text)
+    return headings
+
+
+def _find_target_parent(
+    snode: dict,
+    source_nodes: list[dict],
+    pages_state: dict[str, dict],
+    target_root: str,
+) -> str:
+    """Find the target parent node_token for a new page.
+
+    Walks up the source tree to find the nearest ancestor already in pages_state.
+    """
+    parent_map: dict[str, str] = {}
+    for n in source_nodes:
+        for child_tok in n.get("children_tokens", []):
+            parent_map[child_tok] = n["node_token"]
+
+    current = snode["node_token"]
+    while current in parent_map:
+        parent_src = parent_map[current]
+        if parent_src in pages_state:
+            return pages_state[parent_src]["target_node_token"]
+        current = parent_src
+
+    return target_root
+
+
+def _update_existing_page(
+    token_mgr: TokenManager,
+    source_node_token: str,
+    target_obj_token: str,
+    heading_numbering: bool = False,
+) -> tuple[int, list[dict]]:
+    """Clear target page blocks and re-copy from source.
+
+    Returns (blocks_created, source_blocks).
+    """
+    user_token = token_mgr.get()
+
+    # Read source
+    src_node = get_wiki_node(user_token, source_node_token)
+    src_obj_token = src_node["obj_token"]
+    src_blocks = get_all_blocks(user_token, src_obj_token)
+
+    heading_numbers = None
+    if heading_numbering:
+        heading_numbers = _compute_heading_numbers(src_blocks)
+
+    try:
+        image_cache = _prefetch_images(user_token, src_blocks, source_node_token)
+    except Exception:
+        image_cache = {}
+
+    # Clear target: delete all root children
+    dst_blocks = get_all_blocks(user_token, target_obj_token)
+    dst_root = next((b for b in dst_blocks if b["block_type"] == 1), None)
+    if dst_root and dst_root.get("children"):
+        n_children = len(dst_root["children"])
+        if n_children > 0:
+            delete_children_tail(
+                user_token, target_obj_token, target_obj_token,
+                0, n_children,
+            )
+            time.sleep(0.5)
+
+    # Re-copy from source
+    n = copy_blocks(
+        token_mgr, src_blocks, target_obj_token, image_cache,
+        heading_numbers=heading_numbers,
+    )
+
+    try:
+        user_token = token_mgr.get()
+        _cleanup_empty_tails(user_token, target_obj_token, src_blocks)
+    except Exception:
+        pass
+
+    return n, src_blocks
+
+
+def _build_initial_state(
+    source_root: str,
+    target_root: str,
+    source_space_id: str,
+    target_space_id: str,
+    source_nodes: list[dict],
+    node_map: dict[str, str],
+    doc_map: dict[str, str],
+    obj_map: dict[str, str],
+    heading_numbering: bool,
+    fix_refs: bool,
+) -> dict:
+    """Build sync state after the first full copy."""
+    pages: dict[str, dict] = {}
+    for snode in source_nodes:
+        stok = snode["node_token"]
+        if stok not in node_map:
+            continue
+        target_ntok = node_map[stok]
+        target_otok = doc_map.get(target_ntok, "")
+
+        pages[stok] = {
+            "target_node_token": target_ntok,
+            "target_obj_token": target_otok,
+            "source_obj_token": snode["obj_token"],
+            "title": snode["title"],
+            "obj_edit_time": snode.get("obj_edit_time", ""),
+            "content_hash": "",  # computed on first incremental run
+            "last_synced": datetime.now(timezone.utc).isoformat(),
+            "children_order": snode.get("children_tokens", []),
+        }
+
+    return {
+        "version": 1,
+        "source_root": source_root,
+        "target_root": target_root,
+        "source_space_id": source_space_id,
+        "target_space_id": target_space_id,
+        "last_sync_time": datetime.now(timezone.utc).isoformat(),
+        "options": {
+            "heading_numbers": heading_numbering,
+            "fix_refs": fix_refs,
+        },
+        "pages": pages,
+    }
+
+
+def _print_sync_summary(summary: dict) -> None:
+    """Print a human-readable sync summary (goes to both console and log file)."""
+    lines: list[str] = []
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append("  SYNC SUMMARY")
+    lines.append("=" * 60)
+
+    if summary["new"]:
+        lines.append(f"\n  NEW ({len(summary['new'])} page(s)):")
+        for title, headings in summary["new"]:
+            lines.append(f"    + {title}")
+            for h in headings[:5]:
+                lines.append(f"        {h}")
+            if len(headings) > 5:
+                lines.append(f"        ... and {len(headings) - 5} more")
+
+    if summary["modified"]:
+        lines.append(f"\n  MODIFIED ({len(summary['modified'])} page(s)):")
+        for title, sections in summary["modified"]:
+            lines.append(f"    ~ {title}")
+            for line in sections:
+                lines.append(f"      {line}")
+
+    if summary["deleted"]:
+        lines.append(f"\n  DELETED FROM SOURCE ({len(summary['deleted'])} page(s)):")
+        for title in summary["deleted"]:
+            lines.append(f"    - {title}  (target kept)")
+
+    lines.append(f"\n  UNCHANGED: {summary['unchanged']} page(s)")
+    total = len(summary["new"]) + len(summary["modified"]) + summary["unchanged"]
+    lines.append(f"\n  Total: {total} page(s) in source tree")
+    lines.append("=" * 60)
+    lines.append("")
+
+    # Use log.info so it goes to both console and log file
+    log.info("\n".join(lines))
+
+
+def _sync_recursive(
+    token_mgr: TokenManager,
+    source_node_token: str,
+    source_space_id: str,
+    target_space_id: str,
+    target_node_token: str,
+    heading_numbering: bool = False,
+    fix_refs: bool = True,
+    title: str | None = None,
+) -> None:
+    """Incremental sync: compare source tree against saved state, process changes.
+
+    First run (no state file): full copy like --recursive, then save state.
+    Subsequent runs: only process new/modified pages, print summary.
+    State is saved even on error so partial progress is never lost.
+    """
+    state = _load_sync_state()
+    is_first_sync = state is None
+
+    if state and (state.get("source_root") != source_node_token
+                  or state.get("target_root") != target_node_token):
+        log.error(
+            "Sync state mismatch. State: %s → %s, Args: %s → %s. "
+            "Delete %s to start fresh.",
+            state.get("source_root"), state.get("target_root"),
+            source_node_token, target_node_token, _SYNC_STATE_FILE,
+        )
+        raise SystemExit(1)
+
+    # Inherit options from first run (user only needs to set flags once)
+    if state and not is_first_sync:
+        saved_opts = state.get("options", {})
+        if saved_opts.get("heading_numbers") and not heading_numbering:
+            heading_numbering = True
+            log.debug("  Inherited --heading-numbers from saved state")
+        if saved_opts.get("fix_refs") and not fix_refs:
+            fix_refs = True
+
+    # ── Phase 1: Scan source tree ────────────────────────────────────
+    log.info("Scanning source tree …")
+    source_nodes = _scan_source_tree(token_mgr, source_node_token, source_space_id)
+    source_tokens = {n["node_token"] for n in source_nodes}
+    log.info("  %d page(s) in source tree", len(source_nodes))
+
+    if is_first_sync:
+        # ── First sync: full copy ────────────────────────────────────
+        log.info("First sync — copying all pages …")
+        node_map: dict[str, str] = {}
+        doc_map: dict[str, str] = {}
+        obj_map: dict[str, str] = {}
+
+        try:
+            total_pages = _copy_recursive(
+                token_mgr, source_node_token, source_space_id,
+                target_space_id, target_node_token,
+                title=title, heading_numbering=heading_numbering,
+                node_map=node_map, doc_map=doc_map, obj_map=obj_map,
+            )
+        except Exception:
+            # Save partial state so next run can resume
+            if node_map:
+                log.warning("Copy interrupted — saving partial state …")
+                partial = _build_initial_state(
+                    source_node_token, target_node_token,
+                    source_space_id, target_space_id,
+                    source_nodes, node_map, doc_map, obj_map,
+                    heading_numbering, fix_refs,
+                )
+                _save_sync_state(partial)
+            raise
+
+        if fix_refs and node_map:
+            _fixup_references(token_mgr, node_map, obj_map, doc_map)
+
+        state = _build_initial_state(
+            source_node_token, target_node_token,
+            source_space_id, target_space_id,
+            source_nodes, node_map, doc_map, obj_map,
+            heading_numbering, fix_refs,
+        )
+        _save_sync_state(state)
+        log.info("Done — %d page(s) copied. State saved.", total_pages)
+        return
+
+    # ── Phase 2: Classify pages ──────────────────────────────────────
+    pages_state = state.get("pages", {})
+
+    new_pages: list[dict] = []
+    modified_pages: list[dict] = []
+    unchanged_pages: list[dict] = []
+    deleted_pages: list[dict] = []
+
+    for snode in source_nodes:
+        stok = snode["node_token"]
+        if stok not in pages_state:
+            new_pages.append(snode)
+        else:
+            stored = pages_state[stok]
+            if snode["obj_edit_time"] != stored.get("obj_edit_time", ""):
+                modified_pages.append(snode)
+            else:
+                unchanged_pages.append(snode)
+
+    for stok, pstate in pages_state.items():
+        if stok not in source_tokens:
+            deleted_pages.append(pstate)
+
+    if not new_pages and not modified_pages and not deleted_pages:
+        log.info("  Everything up to date — no changes detected.")
+        _print_sync_summary({
+            "new": [], "modified": [], "deleted": [],
+            "unchanged": len(unchanged_pages),
+        })
+        return
+
+    log.info("  %d new, %d possibly modified, %d unchanged, %d deleted",
+             len(new_pages), len(modified_pages),
+             len(unchanged_pages), len(deleted_pages))
+
+    # Rebuild maps from state for fix-refs
+    node_map = {}
+    doc_map = {}
+    obj_map = {}
+    for stok, pstate in pages_state.items():
+        node_map[stok] = pstate["target_node_token"]
+        doc_map[pstate["target_node_token"]] = pstate["target_obj_token"]
+        obj_map[pstate["source_obj_token"]] = pstate["target_obj_token"]
+
+    sync_summary: dict = {
+        "new": [],
+        "modified": [],
+        "unchanged": len(unchanged_pages),
+        "deleted": [],
+    }
+
+    # Wrap processing in try/finally to save state even on error
+    try:
+        # ── Phase 3a: Process NEW pages ──────────────────────────────
+        for snode in new_pages:
+            stok = snode["node_token"]
+            if snode["obj_type"] != "docx":
+                log.warning("  Skipping non-docx new page: %s (type=%s)",
+                            snode["title"], snode["obj_type"])
+                continue
+
+            target_parent = _find_target_parent(
+                snode, source_nodes, pages_state, target_node_token,
+            )
+
+            log.info("  [NEW] %s", snode["title"])
+            new_ntok, new_otok = _copy_single_page(
+                token_mgr, stok, target_space_id, target_parent,
+                depth=snode["depth"], heading_numbering=heading_numbering,
+                node_map=node_map, doc_map=doc_map, obj_map=obj_map,
+            )
+            if new_ntok:
+                user_token = token_mgr.get()
+                blocks = get_all_blocks(user_token, snode["obj_token"])
+                headings = _extract_headings(blocks)
+
+                pages_state[stok] = {
+                    "target_node_token": new_ntok,
+                    "target_obj_token": new_otok,
+                    "source_obj_token": snode["obj_token"],
+                    "title": snode["title"],
+                    "obj_edit_time": snode["obj_edit_time"],
+                    "content_hash": _compute_content_hash(blocks),
+                    "last_synced": datetime.now(timezone.utc).isoformat(),
+                    "children_order": snode.get("children_tokens", []),
+                }
+                sync_summary["new"].append((snode["title"], headings))
+
+            time.sleep(1)
+
+        # ── Phase 3b: Process MODIFIED pages ─────────────────────────
+        for snode in modified_pages:
+            stok = snode["node_token"]
+            stored = pages_state[stok]
+            target_otok = stored["target_obj_token"]
+
+            user_token = token_mgr.get()
+            src_blocks = get_all_blocks(user_token, snode["obj_token"])
+            new_hash = _compute_content_hash(src_blocks)
+
+            if new_hash == stored.get("content_hash", "") and stored.get("content_hash"):
+                log.info("  [SKIP] %s (timestamp changed, content identical)",
+                         snode["title"])
+                pages_state[stok]["obj_edit_time"] = snode["obj_edit_time"]
+                sync_summary["unchanged"] += 1
+                continue
+
+            log.info("  [MOD] %s", snode["title"])
+            n, _ = _update_existing_page(
+                token_mgr, stok, target_otok,
+                heading_numbering=heading_numbering,
+            )
+            log.info("    %d blocks re-created", n)
+
+            headings = _extract_headings(src_blocks)
+            sections_str = ", ".join(headings[:6]) if headings else "(no headings)"
+            if len(headings) > 6:
+                sections_str += f" … +{len(headings) - 6} more"
+            sync_summary["modified"].append(
+                (snode["title"], [f"Sections: {sections_str}"])
+            )
+
+            pages_state[stok].update({
+                "title": snode["title"],
+                "obj_edit_time": snode["obj_edit_time"],
+                "content_hash": new_hash,
+                "last_synced": datetime.now(timezone.utc).isoformat(),
+                "children_order": snode.get("children_tokens", []),
+            })
+
+            time.sleep(1)
+
+        # ── Phase 3c: Handle DELETED pages ───────────────────────────
+        for dpage in deleted_pages:
+            dtitle = dpage.get("title", "Unknown")
+            sync_summary["deleted"].append(dtitle)
+            log.warning("  [DEL] %s (target kept: %s)",
+                         dtitle, dpage.get("target_node_token", "?"))
+
+        # Remove deleted entries from state
+        for stok in list(pages_state.keys()):
+            if stok not in source_tokens:
+                del pages_state[stok]
+
+        # ── Phase 3d: Fix refs if new pages added ────────────────────
+        if fix_refs and new_pages and node_map:
+            _fixup_references(token_mgr, node_map, obj_map, doc_map)
+
+    finally:
+        # Always save state — even on error, partial progress is preserved
+        state["pages"] = pages_state
+        state["last_sync_time"] = datetime.now(timezone.utc).isoformat()
+        _save_sync_state(state)
+        log.info("State saved.")
+
+    # ── Phase 5: Print summary ───────────────────────────────────────
+    _print_sync_summary(sync_summary)
+
+
 # ── Single-page copy helper ──────────────────────────────────────────────────
 
 
@@ -1098,30 +1641,56 @@ def _copy_recursive(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Copy a Feishu wiki page to a new wiki page"
+        description="Copy / sync Feishu wiki pages",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  %(prog)s SOURCE TARGET -s -n          # daily sync with heading numbers\n"
+            "  %(prog)s SOURCE TARGET -r --fix-refs   # one-time full copy\n"
+            "  %(prog)s SOURCE TARGET                 # single page copy\n"
+        ),
     )
     parser.add_argument("source", help="Source wiki URL or node token")
     parser.add_argument("target", help="Target parent wiki URL or node token")
-    parser.add_argument("--title", help="New page title (default: original title)")
+    parser.add_argument("--title", help="Custom page title (default: original)")
     parser.add_argument(
-        "-r", "--recursive", action="store_true",
-        help="Recursively copy all subpages",
+        "-s", "--sync", action="store_true",
+        help="Incremental sync (implies --fix-refs; remembers flags from first run)",
     )
     parser.add_argument(
-        "--heading-numbers", action="store_true",
-        help="Prepend auto-generated hierarchical numbers to headings (e.g., 1.1, 1.2)",
+        "-r", "--recursive", action="store_true",
+        help="One-time recursive copy of all subpages",
+    )
+    parser.add_argument(
+        "-n", "--numbers", action="store_true", dest="heading_numbers",
+        help="Prepend auto-numbered headings (e.g., 1.1, 1.2)",
     )
     parser.add_argument(
         "--fix-refs", action="store_true",
-        help="Fix document references to point to copied pages (use with -r)",
+        help="Fix doc references to point to copied pages (auto with -s)",
+    )
+    parser.add_argument(
+        "--log-dir", default=_DEFAULT_LOG_DIR, metavar="DIR",
+        help=f"Directory for sync log files (default: {_DEFAULT_LOG_DIR})",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
+
+    # --sync implies --fix-refs
+    if args.sync:
+        args.fix_refs = True
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
     )
+
+    # Set up file logging for sync mode
+    log_file = None
+    if args.sync:
+        log_file = _setup_file_logging(args.log_dir)
+        if log_file:
+            log.info("Log file: %s", log_file)
 
     app_id = os.getenv("FEISHU_APP_ID")
     app_secret = os.getenv("FEISHU_APP_SECRET")
@@ -1139,7 +1708,23 @@ def main() -> None:
     target_node = get_wiki_node(user_token, target_node_token)
     target_space_id = target_node["space_id"]
 
-    if args.recursive:
+    if args.sync:
+        # ── Incremental sync mode ────────────────────────────────────────
+        src_node = get_wiki_node(user_token, source_node_token)
+        source_space_id = src_node["space_id"]
+
+        try:
+            _sync_recursive(
+                token_mgr, source_node_token, source_space_id,
+                target_space_id, target_node_token,
+                heading_numbering=args.heading_numbers,
+                fix_refs=args.fix_refs,
+                title=args.title,
+            )
+        finally:
+            _close_browser()
+
+    elif args.recursive:
         # ── Recursive mode ───────────────────────────────────────────────
         src_node = get_wiki_node(user_token, source_node_token)
         source_space_id = src_node["space_id"]

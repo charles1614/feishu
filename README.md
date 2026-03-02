@@ -4,12 +4,15 @@ Copy and export Feishu (Lark) wiki pages via the Open API, preserving text, form
 
 ## Features
 
+- **Incremental sync** (`-s`) — daily sync that only copies new/changed pages, with structured change summary
 - **Copy wiki pages** between spaces with full fidelity (text, images, layout)
+- **Auto-numbered headings** (`-n`) — prepends hierarchical numbers (1.1, 1.2.1) styled in blue
+- **Reference remapping** — internal links auto-updated to point to copied pages
 - **Export to markdown** with inline LaTeX, code blocks, nested lists, and callouts
 - **Full-resolution image transfer** via browser session fallback when API returns 403
 - **Parallel image download** (ThreadPoolExecutor for API, sequential Playwright fallback)
 - **Auto token refresh** for long-running copies (>90 min)
-- **Post-copy cleanup** of Feishu auto-created empty paragraphs
+- **Sync logging** — each sync run saved to `sync_logs/YY-MM-DD-NNN.log` for audit
 
 ## Quick Start
 
@@ -24,11 +27,14 @@ playwright install chromium
 cp .env.example .env
 # Edit .env with your Feishu app credentials
 
-# Copy a wiki page
-feishu-copy \
-  https://my.feishu.cn/wiki/SOURCE_TOKEN \
-  https://my.feishu.cn/wiki/TARGET_PARENT_TOKEN \
-  --title "My Copy"
+# Daily sync (recommended) — first run copies everything, subsequent runs are incremental
+feishu-copy SOURCE TARGET -s -n
+
+# One-time full copy with heading numbers and reference fixing
+feishu-copy SOURCE TARGET -r -n --fix-refs
+
+# Copy a single page
+feishu-copy SOURCE TARGET --title "My Copy"
 
 # Export a wiki page to markdown
 feishu-export https://my.feishu.cn/wiki/NODE_TOKEN -o output/
@@ -76,26 +82,65 @@ You only need to re-login if inactive for >30 days.
 
 ## Usage
 
-### Copy a Wiki Page
+### Daily Sync (Recommended)
 
 ```bash
-# Full URLs
-feishu-copy https://my.feishu.cn/wiki/ABC123 https://my.feishu.cn/wiki/DEF456
+# First run — copies everything, saves state
+feishu-copy SOURCE TARGET -s -n
 
-# Or just node tokens
-feishu-copy ABC123 DEF456
-
-# Custom title
-feishu-copy ABC123 DEF456 --title "Backup of My Page"
+# Subsequent runs — only updates new/changed pages
+feishu-copy SOURCE TARGET -s
 ```
 
-The copy process:
-1. Reads source page structure (all blocks)
-2. Downloads all images in parallel
-3. Creates a new child page under the target
-4. Copies blocks level-by-level (BFS), preserving hierarchy
-5. Uploads images at full original resolution
-6. Cleans up auto-created empty paragraphs
+On incremental runs, a structured summary is printed:
+
+```
+============================================================
+  SYNC SUMMARY
+============================================================
+
+  NEW (1 page(s)):
+    + Chapter 5: Advanced Topics
+        Overview
+        Deep Dive
+
+  MODIFIED (1 page(s)):
+    ~ Chapter 2: Getting Started
+      Sections: Introduction, Setup, Configuration
+
+  UNCHANGED: 12 page(s)
+
+  Total: 14 page(s) in source tree
+============================================================
+```
+
+Flags like `-n` (heading numbers) are remembered from the first run — no need to repeat them.
+
+Each sync run is logged to `sync_logs/YY-MM-DD-NNN.log` (auto-incrementing).
+
+### CLI Reference
+
+| Flag | Long | Description |
+|------|------|-------------|
+| `-s` | `--sync` | Incremental sync (implies `--fix-refs`) |
+| `-r` | `--recursive` | One-time full recursive copy |
+| `-n` | `--numbers` | Auto-numbered headings (1.1, 1.2) |
+| | `--fix-refs` | Remap internal links (auto with `-s`) |
+| | `--title` | Custom page title |
+| | `--log-dir` | Custom log directory (default: `sync_logs/`) |
+| `-v` | `--verbose` | Debug output |
+
+### Copy a Single Page
+
+```bash
+feishu-copy ABC123 DEF456 --title "My Copy"
+```
+
+### Recursive Copy (One-Time)
+
+```bash
+feishu-copy SOURCE TARGET -r -n --fix-refs
+```
 
 ### Export to Markdown
 
@@ -104,6 +149,29 @@ feishu-export https://my.feishu.cn/wiki/ABC123 -o output/
 ```
 
 Exports the wiki page (and child pages recursively) as markdown files with images.
+
+## Sync Internals
+
+### How Incremental Sync Works
+
+1. **Scan** — walk the source wiki tree, collect metadata (title, edit timestamp) for every page
+2. **Classify** — compare against saved state:
+   - **New**: source page not in state file → copy it
+   - **Modified**: `obj_edit_time` changed → verify via content hash → re-copy if truly changed
+   - **Deleted**: state entry missing from source → log warning (target kept for safety)
+   - **Unchanged**: skip entirely
+3. **Update** — for modified pages: clear all target blocks → re-copy from source
+4. **Fix refs** — update internal links in all copied pages to point to target pages
+5. **Save state** — persist mapping to `.feishu_sync_state.json` (also saved on error for resumability)
+
+### Change Detection (Two-Tier)
+
+- **Tier 1 — Timestamp** (`obj_edit_time`): fast check, avoids fetching blocks for unchanged pages
+- **Tier 2 — Content hash** (SHA-256): catches metadata-only edits that don't affect content
+
+### State File
+
+The `.feishu_sync_state.json` file maps every source page to its target copy, including edit timestamps and content hashes. Deleting this file triggers a fresh full copy on the next sync.
 
 ## Architecture
 
@@ -197,13 +265,17 @@ Delete `.feishu_token_cache.json` and re-run. You'll be prompted to log in again
 
 ```
 .
-├── feishu_copy_page.py    # Wiki page copier (CLI: feishu-copy)
-├── feishu_wiki.py         # Wiki reader, markdown exporter (CLI: feishu-export)
-├── pyproject.toml         # Package configuration
-├── .env.example           # Credentials template
-├── .env                   # Your credentials (gitignored)
+├── feishu_copy_page.py           # Wiki page copier/syncer (CLI: feishu-copy)
+├── feishu_wiki.py                # Wiki reader, markdown exporter (CLI: feishu-export)
+├── pyproject.toml                # Package configuration
+├── .env.example                  # Credentials template
+├── .env                          # Your credentials (gitignored)
 ├── .feishu_token_cache.json      # OAuth tokens (gitignored)
-└── .feishu_browser_state.json    # Playwright cookies (gitignored)
+├── .feishu_browser_state.json    # Playwright cookies (gitignored)
+├── .feishu_sync_state.json       # Sync state: source↔target mapping (gitignored)
+└── sync_logs/                    # Per-run log files (auto-created)
+    ├── 26-03-01-001.log
+    └── 26-03-02-001.log
 ```
 
 ## License
