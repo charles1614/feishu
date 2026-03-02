@@ -826,15 +826,59 @@ def _cleanup_empty_tails(user_token: str, dst_doc_id: str, src_blocks: list[dict
 # ── Reference fixup ─────────────────────────────────────────────────────────
 
 
+def _remap_url(
+    url: str,
+    node_map: dict[str, str],
+    obj_map: dict[str, str],
+    block_id_map: dict[str, str] | None = None,
+) -> str | None:
+    """Remap a Feishu URL, returning the new URL or None if unchanged.
+
+    Handles /wiki/{node_token} and /docx/{obj_token} URLs, plus #anchor fragments.
+    """
+    new_url = url
+    remapped = False
+
+    # Try node_map (/wiki/{node_token})
+    for src_tok, dst_tok in node_map.items():
+        if src_tok in new_url:
+            new_url = new_url.replace(src_tok, dst_tok)
+            remapped = True
+            break
+
+    # Try obj_map (/docx/{obj_token})
+    if not remapped:
+        for src_tok, dst_tok in obj_map.items():
+            if src_tok in new_url:
+                new_url = new_url.replace(src_tok, dst_tok)
+                remapped = True
+                break
+
+    # Remap #anchor fragment (block IDs like doxcnXXX)
+    # URLs may store '#' as literal '#' or URL-encoded '%23'
+    if block_id_map:
+        for sep in ("#", "%23"):
+            if sep in new_url:
+                base, fragment = new_url.rsplit(sep, 1)
+                if fragment in block_id_map:
+                    new_url = f"{base}{sep}{block_id_map[fragment]}"
+                    remapped = True
+                break
+
+    return new_url if remapped else None
+
+
 def _remap_elements(
     elements: list[dict],
     node_map: dict[str, str],
     obj_map: dict[str, str],
+    block_id_map: dict[str, str] | None = None,
 ) -> bool:
     """Modify elements in-place, replacing source doc references with target.
 
-    node_map: {source_node_token: new_node_token} — for URLs like /wiki/{token}
-    obj_map:  {source_obj_token: new_obj_token}   — for mention_doc.token
+    node_map:     {source_node_token: new_node_token} — for URLs like /wiki/{token}
+    obj_map:      {source_obj_token: new_obj_token}   — for mention_doc.token and /docx/ URLs
+    block_id_map: {source_block_id: target_block_id}  — for #anchor fragments
 
     Returns True if any changes were made.
     """
@@ -842,13 +886,11 @@ def _remap_elements(
     for elem in elements:
         if "mention_doc" in elem:
             doc = elem["mention_doc"]
-            # Remap URL (contains node_token after /wiki/)
             url = doc.get("url", "")
-            for src_tok, dst_tok in node_map.items():
-                if src_tok in url:
-                    doc["url"] = url.replace(src_tok, dst_tok)
-                    changed = True
-                    break
+            new_url = _remap_url(url, node_map, obj_map, block_id_map)
+            if new_url:
+                doc["url"] = new_url
+                changed = True
             # Remap obj_token
             token = doc.get("token", "")
             if token in obj_map:
@@ -860,14 +902,33 @@ def _remap_elements(
             link = style.get("link", {})
             url = link.get("url", "")
             if url:
-                # Node tokens are alphanumeric — appear as-is in encoded URLs
-                for src_tok, dst_tok in node_map.items():
-                    if src_tok in url:
-                        link["url"] = url.replace(src_tok, dst_tok)
-                        changed = True
-                        break
+                new_url = _remap_url(url, node_map, obj_map, block_id_map)
+                if new_url:
+                    link["url"] = new_url
+                    changed = True
 
     return changed
+
+
+def _build_block_id_map(
+    token_mgr: TokenManager,
+    source_obj_token: str,
+    target_obj_token: str,
+) -> dict[str, str]:
+    """Build source_block_id → target_block_id mapping by matching blocks positionally."""
+    user_token = token_mgr.get()
+    src_blocks = get_all_blocks(user_token, source_obj_token)
+    user_token = token_mgr.get()
+    tgt_blocks = get_all_blocks(user_token, target_obj_token)
+
+    if len(src_blocks) != len(tgt_blocks):
+        log.warning("  Block count mismatch: source=%d target=%d (mapping may be incomplete)",
+                    len(src_blocks), len(tgt_blocks))
+
+    mapping: dict[str, str] = {}
+    for sb, tb in zip(src_blocks, tgt_blocks):
+        mapping[sb["block_id"]] = tb["block_id"]
+    return mapping
 
 
 def _fixup_references(
@@ -891,6 +952,9 @@ def _fixup_references(
     fixed_blocks = 0
     fixed_pages = 0
 
+    # Cache block_id maps per source_obj_token to avoid re-fetching
+    block_id_map_cache: dict[str, dict[str, str]] = {}
+
     for new_node_token, new_doc_id in doc_map.items():
         user_token = token_mgr.get()
 
@@ -900,6 +964,43 @@ def _fixup_references(
             log.warning("  Failed to read blocks for fixup (node=%s…): %s",
                         new_node_token[:12], e)
             continue
+
+        # Single pass: collect obj_tokens referenced by anchor URLs
+        referenced_objs: set[str] = set()
+        for block in blocks:
+            bt = block["block_type"]
+            key = _CONTENT_KEY.get(bt)
+            if not key or key not in block:
+                continue
+            for el in block[key].get("elements", []):
+                url = ""
+                if "text_run" in el:
+                    url = el["text_run"].get("text_element_style", {}).get("link", {}).get("url", "")
+                elif "mention_doc" in el:
+                    url = el["mention_doc"].get("url", "")
+                if "#" not in url and "%23" not in url:
+                    continue
+                for src_obj, tgt_obj in obj_map.items():
+                    if src_obj in url or tgt_obj in url:
+                        referenced_objs.add(src_obj)
+                        break
+
+        # Build block_id maps lazily for pages referenced by anchor links
+        block_id_map: dict[str, str] = {}
+        for src_obj in referenced_objs:
+            if src_obj in block_id_map_cache:
+                block_id_map.update(block_id_map_cache[src_obj])
+            else:
+                tgt_obj = obj_map[src_obj]
+                try:
+                    bid_map = _build_block_id_map(token_mgr, src_obj, tgt_obj)
+                    block_id_map_cache[src_obj] = bid_map
+                    block_id_map.update(bid_map)
+                    log.debug("  Built block_id map for %s (%d entries)",
+                              src_obj[:12], len(bid_map))
+                except Exception as e:
+                    log.warning("  Failed to build block_id map for %s: %s",
+                                src_obj[:12], e)
 
         page_fixed = 0
         for block in blocks:
@@ -915,7 +1016,8 @@ def _fixup_references(
 
             # Deep copy elements before modifying
             new_elements = json.loads(json.dumps(elements))
-            if not _remap_elements(new_elements, node_map, obj_map):
+            if not _remap_elements(new_elements, node_map, obj_map,
+                                   block_id_map or None):
                 continue
 
             # Clean elements for API (remove read-only fields)
