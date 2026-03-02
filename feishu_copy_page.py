@@ -109,10 +109,19 @@ _INITIAL_BACKOFF = 1  # seconds
 
 
 def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
-    """Make an HTTP request with automatic retry on rate-limit errors."""
+    """Make an HTTP request with automatic retry on rate-limit and connection errors."""
+    kwargs.setdefault("timeout", 30)
     backoff = _INITIAL_BACKOFF
     for attempt in range(_MAX_RETRIES):
-        resp = requests.request(method, url, **kwargs)
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt < _MAX_RETRIES - 1:
+                log.warning("  Request failed (%s), retrying in %ds …", exc, backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            raise
         # Retry on HTTP 429
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", backoff))
@@ -1256,7 +1265,8 @@ def _print_sync_summary(summary: dict, log_dir: str = _DEFAULT_LOG_DIR) -> None:
     # Append to dedicated summary file for easy review
     try:
         os.makedirs(log_dir, exist_ok=True)
-        summary_file = os.path.join(log_dir, "sync_summary.log")
+        date_str = datetime.now().strftime("%y-%m-%d")
+        summary_file = os.path.join(log_dir, f"sync_summary_{date_str}.log")
         with open(summary_file, "a", encoding="utf-8") as f:
             f.write(text + "\n")
     except OSError:
@@ -1359,7 +1369,11 @@ def _sync_recursive(
     for snode in source_nodes:
         stok = snode["node_token"]
         if stok not in pages_state:
-            new_pages.append(snode)
+            if snode["obj_type"] != "docx":
+                log.info("  Skipping non-docx page: %s (type=%s)",
+                         snode["title"], snode["obj_type"])
+            else:
+                new_pages.append(snode)
         else:
             stored = pages_state[stok]
             if snode["obj_edit_time"] != stored.get("obj_edit_time", ""):
@@ -1399,16 +1413,13 @@ def _sync_recursive(
         "deleted": [],
     }
 
+    pages_changed = False  # track whether any actual copies/updates happened
+
     # Wrap processing in try/finally to save state even on error
     try:
         # ── Phase 3a: Process NEW pages ──────────────────────────────
         for snode in new_pages:
             stok = snode["node_token"]
-            if snode["obj_type"] != "docx":
-                log.warning("  Skipping non-docx new page: %s (type=%s)",
-                            snode["title"], snode["obj_type"])
-                continue
-
             target_parent = _find_target_parent(
                 snode, source_nodes, pages_state, target_node_token,
             )
@@ -1420,6 +1431,7 @@ def _sync_recursive(
                 node_map=node_map, doc_map=doc_map, obj_map=obj_map,
             )
             if new_ntok:
+                pages_changed = True
                 user_token = token_mgr.get()
                 blocks = get_all_blocks(user_token, snode["obj_token"])
                 headings = _extract_headings(blocks)
@@ -1456,6 +1468,7 @@ def _sync_recursive(
                 continue
 
             log.info("  [MOD] %s", snode["title"])
+            pages_changed = True
             n, _ = _update_existing_page(
                 token_mgr, stok, target_otok,
                 heading_numbering=heading_numbering,
@@ -1492,8 +1505,8 @@ def _sync_recursive(
             if stok not in source_tokens:
                 del pages_state[stok]
 
-        # ── Phase 3d: Fix refs if new pages added ────────────────────
-        if fix_refs and new_pages and node_map:
+        # ── Phase 3d: Fix refs if pages were actually copied/updated ──
+        if fix_refs and pages_changed and node_map:
             _fixup_references(token_mgr, node_map, obj_map, doc_map)
 
     finally:

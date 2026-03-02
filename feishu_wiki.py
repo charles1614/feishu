@@ -68,12 +68,57 @@ def load_refresh_token() -> str | None:
         return json.load(f).get("refresh_token")
 
 
+# ── Request helpers ──────────────────────────────────────────────────────────
+
+_REQUEST_TIMEOUT = 30  # seconds
+_MAX_RETRIES = 5
+_INITIAL_BACKOFF = 1  # seconds
+_RATE_LIMIT_CODES = {99991400, 99991429}
+
+
+def _api_request(method: str, url: str, **kwargs) -> requests.Response:
+    """HTTP request with timeout, retry on connection errors and rate limits."""
+    kwargs.setdefault("timeout", _REQUEST_TIMEOUT)
+    backoff = _INITIAL_BACKOFF
+    last_exc = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES - 1:
+                log.warning("Request failed (%s), retrying in %ds …", exc, backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            raise
+        # Retry on HTTP 429
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", backoff))
+            log.debug("Rate limited (HTTP 429), retrying in %ds …", retry_after)
+            time.sleep(retry_after)
+            backoff = min(backoff * 2, 30)
+            continue
+        # Retry on Feishu rate-limit error codes
+        try:
+            data = resp.json()
+            if data.get("code") in _RATE_LIMIT_CODES:
+                log.debug("Rate limited (code=%d), retrying in %ds …", data["code"], backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+        except ValueError:
+            pass
+        return resp
+    return resp  # return last response even if still rate-limited
+
+
 # ── Feishu API ───────────────────────────────────────────────────────────────
 
 
 def get_app_access_token(app_id: str, app_secret: str) -> str:
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/auth/v3/app_access_token/internal",
+    resp = _api_request(
+        "POST", f"{BASE_URL}/open-apis/auth/v3/app_access_token/internal",
         json={"app_id": app_id, "app_secret": app_secret},
     )
     data = resp.json()
@@ -85,8 +130,8 @@ def get_app_access_token(app_id: str, app_secret: str) -> str:
 def get_user_token_by_code(
     app_access_token: str, code: str,
 ) -> tuple[str, int, str | None]:
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/authen/v1/access_token",
+    resp = _api_request(
+        "POST", f"{BASE_URL}/open-apis/authen/v1/access_token",
         json={
             "app_access_token": app_access_token,
             "code": code,
@@ -103,8 +148,8 @@ def get_user_token_by_code(
 def refresh_user_token(
     app_access_token: str, refresh_token: str,
 ) -> tuple[str | None, int | None, str | None]:
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/authen/v1/refresh_access_token",
+    resp = _api_request(
+        "POST", f"{BASE_URL}/open-apis/authen/v1/refresh_access_token",
         json={
             "app_access_token": app_access_token,
             "grant_type": "refresh_token",
@@ -120,8 +165,8 @@ def refresh_user_token(
 
 def get_wiki_node(user_token: str, node_token: str) -> dict:
     """Fetch wiki node metadata (title, obj_token, space_id, etc.)."""
-    resp = requests.get(
-        f"{BASE_URL}/open-apis/wiki/v2/spaces/get_node",
+    resp = _api_request(
+        "GET", f"{BASE_URL}/open-apis/wiki/v2/spaces/get_node",
         headers={"Authorization": f"Bearer {user_token}"},
         params={"token": node_token},
     )
@@ -139,8 +184,8 @@ def get_all_blocks(user_token: str, document_id: str) -> list[dict]:
         params: dict = {"page_size": 500}
         if page_token:
             params["page_token"] = page_token
-        resp = requests.get(
-            f"{BASE_URL}/open-apis/docx/v1/documents/{document_id}/blocks",
+        resp = _api_request(
+            "GET", f"{BASE_URL}/open-apis/docx/v1/documents/{document_id}/blocks",
             headers={"Authorization": f"Bearer {user_token}"},
             params=params,
         )
@@ -164,8 +209,8 @@ def get_wiki_children(
         params: dict = {"parent_node_token": parent_node_token, "page_size": 50}
         if page_token:
             params["page_token"] = page_token
-        resp = requests.get(
-            f"{BASE_URL}/open-apis/wiki/v2/spaces/{space_id}/nodes",
+        resp = _api_request(
+            "GET", f"{BASE_URL}/open-apis/wiki/v2/spaces/{space_id}/nodes",
             headers={"Authorization": f"Bearer {user_token}"},
             params=params,
         )
@@ -343,8 +388,8 @@ def export_docx_and_extract_images(
 ) -> list[str]:
     """Export a Feishu docx as .docx file, extract images into img_dir."""
     # 1. Create export task
-    resp = requests.post(
-        f"{BASE_URL}/open-apis/drive/v1/export_tasks",
+    resp = _api_request(
+        "POST", f"{BASE_URL}/open-apis/drive/v1/export_tasks",
         headers={"Authorization": f"Bearer {user_token}"},
         json={"file_extension": "docx", "token": obj_token, "type": "docx"},
     )
@@ -357,8 +402,8 @@ def export_docx_and_extract_images(
     file_token = None
     for _ in range(20):
         time.sleep(2)
-        r = requests.get(
-            f"{BASE_URL}/open-apis/drive/v1/export_tasks/{ticket}",
+        r = _api_request(
+            "GET", f"{BASE_URL}/open-apis/drive/v1/export_tasks/{ticket}",
             headers={"Authorization": f"Bearer {user_token}"},
             params={"token": obj_token},
         )
@@ -373,8 +418,8 @@ def export_docx_and_extract_images(
         raise Exception("Export timed out")
 
     # 3. Download the exported .docx file
-    r = requests.get(
-        f"{BASE_URL}/open-apis/drive/v1/export_tasks/{ticket}/file",
+    r = _api_request(
+        "GET", f"{BASE_URL}/open-apis/drive/v1/export_tasks/{ticket}/file",
         headers={"Authorization": f"Bearer {user_token}"},
         params={"token": obj_token},
         stream=True,
