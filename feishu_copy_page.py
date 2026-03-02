@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -207,6 +208,22 @@ def delete_children_tail(
     data = resp.json()
     if data.get("code") != 0:
         raise Exception(f"batch_delete failed: {data}")
+
+
+def _update_block_elements(
+    user_token: str, doc_id: str, block_id: str, elements: list[dict],
+) -> None:
+    """Update the text elements of a block via PATCH API."""
+    resp = _request_with_retry(
+        "PATCH", f"{BASE_URL}/open-apis/docx/v1/documents/{doc_id}/blocks/{block_id}",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"update_text_elements": {"elements": elements}},
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(
+            f"update_text_elements failed [code={data.get('code')}]: {data.get('msg', '')}"
+        )
 
 
 def download_media(user_token: str, file_token: str) -> bytes:
@@ -787,6 +804,149 @@ def _cleanup_empty_tails(user_token: str, dst_doc_id: str, src_blocks: list[dict
         log.info("  Cleaned up %d auto-created empty paragraph(s)", deleted)
 
 
+# ── Reference fixup ─────────────────────────────────────────────────────────
+
+
+def _remap_elements(
+    elements: list[dict],
+    node_map: dict[str, str],
+    obj_map: dict[str, str],
+) -> bool:
+    """Modify elements in-place, replacing source doc references with target.
+
+    node_map: {source_node_token: new_node_token} — for URLs like /wiki/{token}
+    obj_map:  {source_obj_token: new_obj_token}   — for mention_doc.token
+
+    Returns True if any changes were made.
+    """
+    changed = False
+    for elem in elements:
+        if "mention_doc" in elem:
+            doc = elem["mention_doc"]
+            # Remap URL (contains node_token after /wiki/)
+            url = doc.get("url", "")
+            for src_tok, dst_tok in node_map.items():
+                if src_tok in url:
+                    doc["url"] = url.replace(src_tok, dst_tok)
+                    changed = True
+                    break
+            # Remap obj_token
+            token = doc.get("token", "")
+            if token in obj_map:
+                doc["token"] = obj_map[token]
+                changed = True
+
+        elif "text_run" in elem:
+            style = elem["text_run"].get("text_element_style", {})
+            link = style.get("link", {})
+            url = link.get("url", "")
+            if url:
+                # Node tokens are alphanumeric — appear as-is in encoded URLs
+                for src_tok, dst_tok in node_map.items():
+                    if src_tok in url:
+                        link["url"] = url.replace(src_tok, dst_tok)
+                        changed = True
+                        break
+
+    return changed
+
+
+def _fixup_references(
+    token_mgr: TokenManager,
+    node_map: dict[str, str],
+    obj_map: dict[str, str],
+    doc_map: dict[str, str],
+) -> int:
+    """Post-copy pass: update document references in all copied pages.
+
+    node_map: {source_node_token: new_node_token}
+    obj_map:  {source_obj_token: new_doc_id}
+    doc_map:  {new_node_token: new_doc_id}
+
+    Returns number of blocks updated.
+    """
+    if not node_map:
+        return 0
+
+    log.info("Fixing document references across %d page(s) …", len(doc_map))
+    fixed_blocks = 0
+    fixed_pages = 0
+
+    for new_node_token, new_doc_id in doc_map.items():
+        user_token = token_mgr.get()
+
+        try:
+            blocks = get_all_blocks(user_token, new_doc_id)
+        except Exception as e:
+            log.warning("  Failed to read blocks for fixup (node=%s…): %s",
+                        new_node_token[:12], e)
+            continue
+
+        page_fixed = 0
+        for block in blocks:
+            bt = block["block_type"]
+            key = _CONTENT_KEY.get(bt)
+            if not key or key not in block:
+                continue
+
+            content = block[key]
+            elements = content.get("elements")
+            if not elements:
+                continue
+
+            # Deep copy elements before modifying
+            new_elements = json.loads(json.dumps(elements))
+            if not _remap_elements(new_elements, node_map, obj_map):
+                continue
+
+            # Clean elements for API (remove read-only fields)
+            new_elements = _clean(new_elements)
+            try:
+                _update_block_elements(
+                    user_token, new_doc_id, block["block_id"], new_elements,
+                )
+                page_fixed += 1
+                log.debug("  Fixed ref in block %s (type=%d)", block["block_id"], bt)
+            except Exception as e:
+                # Fallback: convert mention_doc to text_run links and retry
+                has_mention = any("mention_doc" in el for el in new_elements)
+                if has_mention:
+                    for i, el in enumerate(new_elements):
+                        if "mention_doc" in el:
+                            doc = el["mention_doc"]
+                            title = doc.get("title", "link")
+                            url = doc.get("url", "")
+                            new_elements[i] = {
+                                "text_run": {
+                                    "content": title,
+                                    "text_element_style": {
+                                        "link": {"url": urllib.parse.quote(url, safe="")},
+                                    },
+                                },
+                            }
+                    try:
+                        _update_block_elements(
+                            user_token, new_doc_id, block["block_id"], new_elements,
+                        )
+                        page_fixed += 1
+                        log.debug("  Fixed ref (fallback) in block %s", block["block_id"])
+                    except Exception as e2:
+                        log.warning("  Failed to fix block %s: %s", block["block_id"], e2)
+                else:
+                    log.warning("  Failed to fix block %s: %s", block["block_id"], e)
+
+            time.sleep(0.3)
+
+        if page_fixed:
+            fixed_blocks += page_fixed
+            fixed_pages += 1
+            log.info("  Fixed %d ref(s) in %s",
+                     page_fixed, f"https://my.feishu.cn/wiki/{new_node_token}")
+
+    log.info("Reference fixup done: %d block(s) in %d page(s)", fixed_blocks, fixed_pages)
+    return fixed_blocks
+
+
 # ── Single-page copy helper ──────────────────────────────────────────────────
 
 
@@ -798,10 +958,14 @@ def _copy_single_page(
     title: str | None = None,
     depth: int = 0,
     heading_numbering: bool = False,
+    node_map: dict[str, str] | None = None,
+    doc_map: dict[str, str] | None = None,
+    obj_map: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Copy one wiki page's content under the target node.
 
     Returns (new_node_token, new_obj_token / dst_doc_id).
+    If node_map/doc_map/obj_map are provided, populates them with the mapping.
     """
     indent = "  " * depth
     user_token = token_mgr.get()
@@ -848,6 +1012,14 @@ def _copy_single_page(
     )
     log.info("%s  → %s", indent, f"https://my.feishu.cn/wiki/{node_token}")
 
+    # Populate reference mapping tables
+    if node_map is not None:
+        node_map[source_node_token] = node_token
+    if doc_map is not None:
+        doc_map[node_token] = dst_doc_id
+    if obj_map is not None:
+        obj_map[obj_token] = dst_doc_id
+
     # Copy blocks
     n = copy_blocks(token_mgr, blocks, dst_doc_id, image_cache, heading_numbers=heading_numbers)
     log.info("%s  %d blocks created", indent, n)
@@ -874,6 +1046,9 @@ def _copy_recursive(
     title: str | None = None,
     depth: int = 0,
     heading_numbering: bool = False,
+    node_map: dict[str, str] | None = None,
+    doc_map: dict[str, str] | None = None,
+    obj_map: dict[str, str] | None = None,
 ) -> int:
     """Recursively copy a wiki page and all its subpages.
 
@@ -885,6 +1060,7 @@ def _copy_recursive(
     new_node_token, _ = _copy_single_page(
         token_mgr, source_node_token, target_space_id, target_node_token,
         title=title, depth=depth, heading_numbering=heading_numbering,
+        node_map=node_map, doc_map=doc_map, obj_map=obj_map,
     )
     if not new_node_token:
         return 0
@@ -911,6 +1087,7 @@ def _copy_recursive(
             token_mgr, child_token, source_space_id,
             target_space_id, new_node_token,
             depth=depth + 1, heading_numbering=heading_numbering,
+            node_map=node_map, doc_map=doc_map, obj_map=obj_map,
         )
 
     return count
@@ -933,6 +1110,10 @@ def main() -> None:
     parser.add_argument(
         "--heading-numbers", action="store_true",
         help="Prepend auto-generated hierarchical numbers to headings (e.g., 1.1, 1.2)",
+    )
+    parser.add_argument(
+        "--fix-refs", action="store_true",
+        help="Fix document references to point to copied pages (use with -r)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
@@ -965,14 +1146,21 @@ def main() -> None:
         new_title = args.title  # None means use original title per page
 
         log.info("Recursively copying %s → %s …", source_node_token, target_node_token)
+        node_map: dict[str, str] = {}
+        doc_map: dict[str, str] = {}
+        obj_map: dict[str, str] = {}
         try:
             total_pages = _copy_recursive(
                 token_mgr, source_node_token, source_space_id,
                 target_space_id, target_node_token,
                 title=new_title,
                 heading_numbering=args.heading_numbers,
+                node_map=node_map, doc_map=doc_map, obj_map=obj_map,
             )
             log.info("Done — %d page(s) copied", total_pages)
+
+            if args.fix_refs and node_map:
+                _fixup_references(token_mgr, node_map, obj_map, doc_map)
         finally:
             _close_browser()
     else:
