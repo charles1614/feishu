@@ -1208,12 +1208,17 @@ def _build_initial_state(
     }
 
 
-def _print_sync_summary(summary: dict) -> None:
-    """Print a human-readable sync summary (goes to both console and log file)."""
+def _print_sync_summary(summary: dict, log_dir: str = _DEFAULT_LOG_DIR) -> None:
+    """Print sync summary to console, log file, AND a dedicated summary file.
+
+    The summary is appended to sync_logs/sync_summary.log so all sync
+    results are in one easy-to-read file, newest at the bottom.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines: list[str] = []
     lines.append("")
     lines.append("=" * 60)
-    lines.append("  SYNC SUMMARY")
+    lines.append(f"  SYNC SUMMARY  ({now})")
     lines.append("=" * 60)
 
     if summary["new"]:
@@ -1243,8 +1248,19 @@ def _print_sync_summary(summary: dict) -> None:
     lines.append("=" * 60)
     lines.append("")
 
-    # Use log.info so it goes to both console and log file
-    log.info("\n".join(lines))
+    text = "\n".join(lines)
+
+    # Console + log file
+    log.info(text)
+
+    # Append to dedicated summary file for easy review
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        summary_file = os.path.join(log_dir, "sync_summary.log")
+        with open(summary_file, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
 
 
 def _sync_recursive(
@@ -1256,6 +1272,7 @@ def _sync_recursive(
     heading_numbering: bool = False,
     fix_refs: bool = True,
     title: str | None = None,
+    log_dir: str = _DEFAULT_LOG_DIR,
 ) -> None:
     """Incremental sync: compare source tree against saved state, process changes.
 
@@ -1359,7 +1376,7 @@ def _sync_recursive(
         _print_sync_summary({
             "new": [], "modified": [], "deleted": [],
             "unchanged": len(unchanged_pages),
-        })
+        }, log_dir=log_dir)
         return
 
     log.info("  %d new, %d possibly modified, %d unchanged, %d deleted",
@@ -1487,7 +1504,7 @@ def _sync_recursive(
         log.info("State saved.")
 
     # ── Phase 5: Print summary ───────────────────────────────────────
-    _print_sync_summary(sync_summary)
+    _print_sync_summary(sync_summary, log_dir=log_dir)
 
 
 # ── Single-page copy helper ──────────────────────────────────────────────────
@@ -1720,6 +1737,7 @@ def main() -> None:
                 heading_numbering=args.heading_numbers,
                 fix_refs=args.fix_refs,
                 title=args.title,
+                log_dir=args.log_dir,
             )
         finally:
             _close_browser()
