@@ -1,5 +1,7 @@
 .env
 .feishu_token_cache.json
 .feishu_browser_state.json
+.feishu_sync_state.json
 __pycache__/
+sync_logs/
 .claude/
